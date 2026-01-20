@@ -1,0 +1,6 @@
+- id: ISR-001
+  name: "Blocking Call in ISR"
+  match: ["HAL_Delay", "vTaskDelay", "printf"]
+  severity: "HIGH"
+  message: "Blocking call detected inside an interrupt."
+  fix: "Move work to main loop or RTOS task."
