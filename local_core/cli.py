@@ -15,12 +15,29 @@ except Exception as e:
     print("❌ IMPORT ERROR:", e)
     sys.exit(1)
 
+from parsers.cube_ioc import CubeMXParser
+from local_core.peripheral_graph import PeripheralGraph
+from local_core.clock_tree import ClockTreeAnalyzer
+
+
 def main():
-    # pick log file
     if len(sys.argv) > 1:
-        log_path = Path(sys.argv[1])
+        arg = Path(sys.argv[1])
     else:
-        log_path = Path("build.log")
+        arg = Path("build.log")
+
+    # --- Handle .ioc files first ---
+    if arg.suffix.lower() == ".ioc":
+        if "--graph" in sys.argv:
+            graph_ioc_command(arg)
+        elif "--clock" in sys.argv:
+            clock_ioc_command(arg)
+        else:
+            parse_ioc_command(arg)
+        return
+
+    # --- Otherwise treat as build log ---
+    log_path = arg
 
     print("DEBUG: Using log file:", log_path.resolve())
     print("DEBUG: Exists? ", log_path.exists())
@@ -46,6 +63,65 @@ def main():
         for err in errors[:3]:
             print("\nERROR:", err)
             print(ask_local_llm(build_explain_prompt(err)))
+
+
+def parse_ioc_command(ioc_path):
+    parser = CubeMXParser(ioc_path).load()
+    summary = parser.summary()
+
+    print("\n=== CubeMX Project Summary ===")
+    print(f"MCU: {summary['mcu']}")
+
+    print("\nPins:")
+    for pin, info in summary["pins"].items():
+        print(f"  {pin}: {info}")
+
+    print("\nRCC:")
+    for key, val in summary["rcc"].items():
+        print(f"  {key}: {val}")
+
+    print("\nNVIC:")
+    for key, val in summary["nvic"].items():
+        print(f"  {key}: {val}")
+
+    print("\nDMA:")
+    for key, val in summary["dma"].items():
+        print(f"  {key}: {val}")
+
+    print("\nPeripherals:")
+    for name, cfg in summary["peripherals"].items():
+        print(f"  {name}: {cfg}")
+
+
+def graph_ioc_command(ioc_path):
+    parser = CubeMXParser(ioc_path).load()
+    summary = parser.summary()
+
+    graph = PeripheralGraph().build_from_ioc(summary)
+
+    print("\n=== Peripheral Graph Summary ===")
+    print("Nodes:")
+    for n, attrs in graph.nodes(data=True):
+        print(f"  {n} ({attrs})")
+
+    print("\nEdges:")
+    for src, dst, attrs in graph.edges(data=True):
+        print(f"  {src} -> {dst} [{attrs}]")
+
+def clock_ioc_command(ioc_path):
+    parser = CubeMXParser(ioc_path).load()
+    summary = parser.summary()
+
+    analyzer = ClockTreeAnalyzer(summary["rcc"])
+    clocks = analyzer.compute()
+
+    print("\n=== Clock Tree Summary ===")
+    for name, val in clocks.items():
+        if val is None:
+            print(f"  {name}: unknown")
+        else:
+            print(f"  {name}: {val/1_000_000:.2f} MHz")
+
 
 if __name__ == "__main__":
     main()
