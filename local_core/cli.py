@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import json
 
 # --- FIX IMPORT PATHS ---
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,35 +22,55 @@ from local_core.clock_tree import ClockTreeAnalyzer
 
 
 def main():
-    if len(sys.argv) > 1:
-        arg = Path(sys.argv[1])
-    else:
-        arg = Path("build.log")
+    import argparse
+    parser = argparse.ArgumentParser()
 
-    # --- Handle .ioc files first ---
+    parser.add_argument("file", help="Path to .ioc or build.log")
+    parser.add_argument("--summary", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--graph", action="store_true")
+    parser.add_argument("--clock", action="store_true")
+
+    args = parser.parse_args()
+    arg = Path(args.file)
+
+    # --- Handle .ioc files ---
     if arg.suffix.lower() == ".ioc":
-        if "--graph" in sys.argv:
-            graph_ioc_command(arg)
-        elif "--clock" in sys.argv:
-            clock_ioc_command(arg)
-        else:
+        ioc = CubeMXParser(arg).load()
+
+        if args.summary:
+            ioc.summary()
+
+        if args.json:
+            data = ioc.to_json("project.json")
+            print("\n=== JSON Output ===")
+            print(json.dumps(data, indent=4))
+
+        if args.graph:
+            graph = PeripheralGraph().build_from_ioc(ioc.to_dict())
+            print("\n=== Peripheral Graph ===")
+            print(graph)
+
+        if args.clock:
+            analyzer = ClockTreeAnalyzer(ioc.get_rcc())
+            clocks = analyzer.compute()
+            print("\n=== Clock Tree Summary ===")
+            for name, val in clocks.items():
+                print(f"  {name}: {val}")
+
+        # Default behavior: summary + JSON
+        if not (args.summary or args.json or args.graph or args.clock):
             parse_ioc_command(arg)
+
         return
 
     # --- Otherwise treat as build log ---
     log_path = arg
-
-    print("DEBUG: Using log file:", log_path.resolve())
-    print("DEBUG: Exists? ", log_path.exists())
-
     if not log_path.exists():
         print("❌ File not found")
         return
 
     text = log_path.read_text(errors="ignore")
-    print("DEBUG: Content length:", len(text))
-    print("DEBUG first 200 chars:\n", text[:200])
-
     findings = parse_build_log(text)
     errors = findings["errors"]
     warnings = findings["warnings"]
@@ -67,30 +88,49 @@ def main():
 
 def parse_ioc_command(ioc_path):
     parser = CubeMXParser(ioc_path).load()
-    summary = parser.summary()
+
+    # Generate full structured data
+    data = parser.to_dict()
+
+    # Print human summary
+    parser.summary()
 
     print("\n=== CubeMX Project Summary ===")
-    print(f"MCU: {summary['mcu']}")
+    print(f"MCU: {data['mcu']}")
 
     print("\nPins:")
-    for pin, info in summary["pins"].items():
+    for pin, info in data["pins"].items():
         print(f"  {pin}: {info}")
 
     print("\nRCC:")
-    for key, val in summary["rcc"].items():
+    for key, val in data["rcc"].items():
         print(f"  {key}: {val}")
 
     print("\nNVIC:")
-    for key, val in summary["nvic"].items():
+    for key, val in data["nvic"].items():
         print(f"  {key}: {val}")
 
     print("\nDMA:")
-    for key, val in summary["dma"].items():
+    for key, val in data["dma"].items():
         print(f"  {key}: {val}")
 
-    print("\nPeripherals:")
-    for name, cfg in summary["peripherals"].items():
+    print("\nADC:")
+    for name, cfg in data["adc"].items():
         print(f"  {name}: {cfg}")
+
+    print("\nUSART:")
+    for name, cfg in data["usart"].items():
+        print(f"  {name}: {cfg}")
+
+    print("\nTIM:")
+    for name, cfg in data["tim"].items():
+        print(f"  {name}: {cfg}")
+
+    # Save JSON file
+    json_data = parser.to_json("project.json")
+
+    print("\n=== JSON Saved to project.json ===")
+    print(json.dumps(json_data, indent=4))
 
 
 def graph_ioc_command(ioc_path):
