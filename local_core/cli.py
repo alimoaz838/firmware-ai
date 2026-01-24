@@ -36,10 +36,13 @@ def main():
     parser.add_argument("--clock", action="store_true")
     parser.add_argument("--rules", action="store_true")
     parser.add_argument("--export-graph", action="store_true")
+    parser.add_argument("--diagnose-usart", type=str)
 
     args = parser.parse_args()
     arg = Path(args.file)
-
+    # Load HAL once for both rules and diagnosis 
+    project_root = ROOT 
+    hal = HalCodeAnalyzer(project_root).load().to_dict()
     # --- Handle .ioc files ---
     if arg.suffix.lower() == ".ioc":
         ioc = CubeMXParser(arg).load()
@@ -56,8 +59,9 @@ def main():
             print(json.dumps(data, indent=4))
 
         # Graph
-        if args.graph or args.rules or args.export_graph:
+        if args.graph or args.rules or args.export_graph or args.diagnose_usart:
             graph = PeripheralGraph().build_from_ioc(model)
+
 
         if args.graph:
             print("\n=== Peripheral Graph Summary ===")
@@ -79,8 +83,6 @@ def main():
 
         # Rules engine
         if args.rules:
-            project_root = ROOT
-            hal = HalCodeAnalyzer(project_root).load().to_dict()
             engine = RulesEngine(model, graph, hal)
             warnings = engine.run_all()
 
@@ -89,9 +91,26 @@ def main():
                 print("  No issues found.")
             else:
                 for w in warnings:
-                    print(f"  [{w['rule']}] {w['message']}")
-                    print(f"     → {w['suggestion']}")
+                    print(f" [{w['rule']}] {w['message']}") 
+                    print(f" → {w['suggestion']}") 
+                    if "code" in w: 
+                        print(" Suggested code:") 
+                        print(w["code"])
             return
+        
+        if args.diagnose_usart:
+            engine = RulesEngine(model, graph, hal)
+            warnings = engine.run_all()
+            usart_warnings = engine.diagnose_usart(args.diagnose_usart)
+            print(f"\n=== Diagnosis for {args.diagnose_usart} ===")
+            for w in usart_warnings:
+                print(f"[{w['rule']}] {w['message']}")
+                print(f" → {w['suggestion']}")
+                if "code" in w:
+                    print("Suggested code:")
+                    print(w["code"])
+            return
+
 
         # Default behavior: summary + JSON
         if not (args.summary or args.json or args.graph or args.clock or args.rules):

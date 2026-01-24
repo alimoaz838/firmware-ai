@@ -14,9 +14,9 @@ class RulesEngine:
         self.model = model
         self.graph = graph
         self.hal_info = hal_info or {}
-        self.warnings: List[Dict[str, str]] = []
+        self.warnings: List[Dict[str, Any]] = []
 
-    def run_all(self) -> List[Dict[str, str]]:
+    def run_all(self) -> List[Dict[str, Any]]:
         self._rule_exti_without_irq()
         self._rule_dma_stream_reused()
         self._rule_usart_configured_but_no_init()
@@ -28,6 +28,7 @@ class RulesEngine:
         self._rule_peripheral_enabled_but_unused()
         self._rule_dma_irq_not_enabled_in_mx_dma_init()
         self._rule_usart_clock_not_enabled_in_mx_usart_init()
+        self._rule_gpio_not_initialized()
         return self.warnings
 
     # ---------------------------------------------------------
@@ -57,7 +58,12 @@ class RulesEngine:
                 self.warnings.append({
                     "rule": "exti_without_irq",
                     "message": f"{exti} mapped to {pins_str} but {irq_name} is not enabled in NVIC",
-                    "suggestion": f"Enable {irq_name} in NVIC in CubeMX and regenerate code."
+                    "suggestion": f"Enable {irq_name} in NVIC in CubeMX or via HAL.",
+                    "code": (
+                        f"// Enable EXTI interrupt for line {line}\n"
+                        f"HAL_NVIC_SetPriority({irq_name}, 0, 0);\n"
+                        f"HAL_NVIC_EnableIRQ({irq_name});"
+                    )
                 })
 
     # ---------------------------------------------------------
@@ -90,7 +96,8 @@ class RulesEngine:
                 self.warnings.append({
                     "rule": "usart_no_init_call",
                     "message": f"{usart_name} configured in .ioc but {func} not called in main.c",
-                    "suggestion": f"Call {func}() during system initialization before using {usart_name}."
+                    "suggestion": f"Call {func}() during system initialization before using {usart_name}.",
+                    "code": f"{func}();"
                 })
 
     # ---------------------------------------------------------
@@ -111,6 +118,9 @@ class RulesEngine:
                     "suggestion": f"Implement {handler}() in your interrupt source file."
                 })
 
+    # ---------------------------------------------------------
+    # Rule: Pin mode mismatch (USART/TIM/ADC)
+    # ---------------------------------------------------------
     def _rule_pin_mode_mismatch(self):
         pins = self.model.get("pins", {})
 
@@ -144,7 +154,10 @@ class RulesEngine:
                     "message": f"{pin} used for ADC but not in Analog mode",
                     "suggestion": f"Set {pin} to Analog mode for ADC input."
                 })
-    
+
+    # ---------------------------------------------------------
+    # Rule: Missing HAL start functions (USART DMA, TIM PWM, ADC IT)
+    # ---------------------------------------------------------
     def _rule_missing_hal_start_functions(self):
         hal_calls = self.hal_info.get("hal_calls", [])
         usart_blocks = self.model.get("usart", {})
@@ -158,7 +171,8 @@ class RulesEngine:
                     self.warnings.append({
                         "rule": "missing_hal_start",
                         "message": f"{usart} uses DMA RX but HAL_UART_Receive_DMA() not called",
-                        "suggestion": f"Call HAL_UART_Receive_DMA(&h{usart.lower()}, buffer, size)."
+                        "suggestion": f"Call HAL_UART_Receive_DMA(&h{usart.lower()}, buffer, size).",
+                        "code": f"HAL_UART_Receive_DMA(&h{usart.lower()}, rx_buffer, RX_SIZE);"
                     })
 
         # TIM PWM
@@ -178,11 +192,14 @@ class RulesEngine:
                     self.warnings.append({
                         "rule": "missing_hal_start",
                         "message": f"{adc} configured but HAL_ADC_Start_IT() not called",
-                        "suggestion": f"Call HAL_ADC_Start_IT(&h{adc.lower()})."
+                        "suggestion": f"Call HAL_ADC_Start_IT(&h{adc.lower()}).",
+                        "code": f"HAL_ADC_Start_IT(&h{adc.lower()});"
                     })
-    
+
+    # ---------------------------------------------------------
+    # Rule: Missing callbacks
+    # ---------------------------------------------------------
     def _rule_missing_callbacks(self):
-        handlers = set(self.hal_info.get("irq_handlers", []))
         callbacks = set(self.hal_info.get("callbacks", []))
 
         # EXTI
@@ -209,6 +226,9 @@ class RulesEngine:
                 "suggestion": "Implement HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)."
             })
 
+    # ---------------------------------------------------------
+    # Rule: Clock domain mismatch (simple USART check)
+    # ---------------------------------------------------------
     def _rule_clock_domain_mismatch(self):
         clocks = self.model.get("rcc", {})
         usart_blocks = self.model.get("usart", {})
@@ -222,13 +242,16 @@ class RulesEngine:
             else:
                 bus = apb1
 
-            if bus < 8000000:  # < 8 MHz is suspicious
+            if bus < 8_000_000:  # < 8 MHz is suspicious
                 self.warnings.append({
                     "rule": "clock_domain_mismatch",
                     "message": f"{usart} running on very low bus clock ({bus} Hz)",
                     "suggestion": "Increase APB clock or lower baud rate."
                 })
 
+    # ---------------------------------------------------------
+    # Rule: Peripheral enabled but unused
+    # ---------------------------------------------------------
     def _rule_peripheral_enabled_but_unused(self):
         hal_calls = self.hal_info.get("hal_calls", [])
         usart_blocks = self.model.get("usart", {})
@@ -262,18 +285,15 @@ class RulesEngine:
                     "suggestion": f"Remove {tim} or start the timer in code."
                 })
 
+    # ---------------------------------------------------------
+    # Rule: DMA IRQ not enabled / not in MX_DMA_Init
+    # ---------------------------------------------------------
     def _rule_dma_irq_not_enabled_in_mx_dma_init(self):
-        """
-        If a DMA stream is configured for a peripheral, check that:
-          - its IRQ is enabled in NVIC
-          - and MX_DMA_Init() body contains HAL_NVIC_EnableIRQ for that IRQ
-        """
         dma_cfg = self.model.get("dma", {})
         nvic = self.model.get("nvic", {})
         mx_bodies = self.hal_info.get("mx_init_bodies", {})
 
         if "DMA" not in mx_bodies:
-            # No MX_DMA_Init at all
             if dma_cfg:
                 self.warnings.append({
                     "rule": "dma_irq_no_mx_dma_init",
@@ -289,7 +309,6 @@ class RulesEngine:
             if not instance:
                 continue
 
-            # Example: DMA1_Stream5 -> DMA1_Stream5_IRQn
             irq_name = f"{instance}_IRQn"
             nvic_entry = nvic.get(irq_name)
 
@@ -297,31 +316,33 @@ class RulesEngine:
                 self.warnings.append({
                     "rule": "dma_irq_not_enabled",
                     "message": f"{instance} used for {req} but {irq_name} is not enabled in NVIC",
-                    "suggestion": f"Enable {irq_name} in NVIC in CubeMX or via HAL_NVIC_EnableIRQ."
+                    "suggestion": f"Enable {irq_name} in NVIC in CubeMX or via HAL_NVIC_EnableIRQ.",
+                    "code": (
+                        f"HAL_NVIC_SetPriority({irq_name}, 0, 0);\n"
+                        f"HAL_NVIC_EnableIRQ({irq_name});"
+                    )
                 })
                 continue
 
-            # Check MX_DMA_Init body for HAL_NVIC_EnableIRQ(DMAx_Streamy_IRQn)
             pattern = rf"HAL_NVIC_EnableIRQ\s*\(\s*{irq_name}\s*\)"
             if not re.search(pattern, dma_body):
                 self.warnings.append({
                     "rule": "dma_irq_not_enabled_in_mx_dma_init",
                     "message": f"{irq_name} enabled in NVIC but MX_DMA_Init() does not call HAL_NVIC_EnableIRQ({irq_name})",
-                    "suggestion": f"Add HAL_NVIC_EnableIRQ({irq_name}); inside MX_DMA_Init()."
+                    "suggestion": f"Add HAL_NVIC_EnableIRQ({irq_name}); inside MX_DMA_Init().",
+                    "code": f"HAL_NVIC_EnableIRQ({irq_name});"
                 })
 
+    # ---------------------------------------------------------
+    # Rule: USART clock not enabled in MX_USARTx_Init
+    # ---------------------------------------------------------
     def _rule_usart_clock_not_enabled_in_mx_usart_init(self):
-        """
-        For each configured USART, check that its MX_USARTx_Init body
-        contains the appropriate __HAL_RCC_USARTx_CLK_ENABLE() call.
-        """
         usart_blocks = self.model.get("usart", {})
         mx_bodies = self.hal_info.get("mx_init_bodies", {})
 
         for usart in usart_blocks:
             body = mx_bodies.get(usart)
             if not body:
-                # No MX_USARTx_Init body found at all
                 self.warnings.append({
                     "rule": "usart_no_mx_init_body",
                     "message": f"{usart} configured in .ioc but MX_{usart}_Init() body not found in code",
@@ -329,17 +350,66 @@ class RulesEngine:
                 })
                 continue
 
-            # Example: __HAL_RCC_USART2_CLK_ENABLE();
             pattern = rf"__HAL_RCC_{usart}_CLK_ENABLE\s*\("
             if not re.search(pattern, body):
                 self.warnings.append({
                     "rule": "usart_clock_not_enabled",
                     "message": f"{usart} configured but MX_{usart}_Init() does not enable its RCC clock",
-                    "suggestion": f"Add __HAL_RCC_{usart}_CLK_ENABLE(); at the start of MX_{usart}_Init()."
+                    "suggestion": f"Add __HAL_RCC_{usart}_CLK_ENABLE(); at the start of MX_{usart}_Init().",
+                    "code": f"__HAL_RCC_{usart}_CLK_ENABLE();"
                 })
 
+    # ---------------------------------------------------------
+    # Rule: GPIO not initialized in MX_GPIO_Init
+    # ---------------------------------------------------------
+    def _rule_gpio_not_initialized(self):
+        mx_bodies = self.hal_info.get("mx_init_bodies", {})
+        gpio_body = mx_bodies.get("GPIO", "")
 
+        if not gpio_body:
+            self.warnings.append({
+                "rule": "missing_mx_gpio_init",
+                "message": "MX_GPIO_Init() not found in project sources",
+                "suggestion": "Ensure MX_GPIO_Init() exists and is called from main.c."
+            })
+            return
 
+        pins = self.model.get("pins", {})
 
+        for pin, info in pins.items():
+            signal = info.get("Signal")
+            if not signal:
+                continue
 
+            if any(x in signal for x in ["USART", "TIM", "ADC", "GPXTI"]):
+                port = pin[:2]  # PA, PB, PC...
+                pattern = rf"\b{port}\b.*\b{pin}\b"
+                if not re.search(pattern, gpio_body):
+                    self.warnings.append({
+                        "rule": "gpio_not_initialized",
+                        "message": f"{pin} used for {signal} but not initialized in MX_GPIO_Init()",
+                        "suggestion": f"Add GPIO init code for {pin} inside MX_GPIO_Init().",
+                        "code": (
+                            f"GPIO_InitTypeDef GPIO_InitStruct = {{0}};\n"
+                            f"__HAL_RCC_{port}_CLK_ENABLE();\n"
+                            f"GPIO_InitStruct.Pin = {pin};\n"
+                            f"GPIO_InitStruct.Mode = GPIO_MODE_AF_PP; // or correct mode for {signal}\n"
+                            f"GPIO_InitStruct.Pull = GPIO_NOPULL;\n"
+                            f"GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;\n"
+                            f"GPIO_InitStruct.Alternate = /* correct AF for {signal} */;\n"
+                            f"HAL_GPIO_Init({port}, &GPIO_InitStruct);"
+                        )
+                    })
 
+    # ---------------------------------------------------------
+    # Diagnose helpers
+    # ---------------------------------------------------------
+    def diagnose_usart(self, name: str) -> List[Dict[str, Any]]:
+        """
+        Return only the warnings relevant to a specific USART peripheral.
+        """
+        relevant = []
+        for w in self.warnings:
+            if name in w.get("message", "") or name in w.get("suggestion", ""):
+                relevant.append(w)
+        return relevant
