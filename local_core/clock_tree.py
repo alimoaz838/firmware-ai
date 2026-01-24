@@ -1,51 +1,105 @@
+from typing import Dict, Any
+
+
 class ClockTreeAnalyzer:
     """
-    Very simple clock tree analyzer for STM32-style PLL configs.
-    Uses data from the .ioc RCC section.
+    Reconstructs a simple clock tree from RCC values in the .ioc model
+    and validates USART baud rates where possible.
     """
 
-    def __init__(self, rcc_section: dict):
-        # rcc_section is summary["rcc"] from CubeMXParser
-        self.rcc = {k.upper(): v for k, v in rcc_section.items()}
-        self.clocks = {}
+    def __init__(self, rcc: Dict[str, Any]):
+        self.rcc = rcc
 
-    def _get_int(self, key, default=None):
-        val = self.rcc.get(key)
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            return default
+    # ---------------------------------------------------------
+    # Basic clock reconstruction
+    # ---------------------------------------------------------
+    def compute(self) -> Dict[str, Any]:
+        out = {}
 
-    def compute(self):
+        def as_int(key):
+            v = self.rcc.get(key)
+            try:
+                return int(v) if v is not None else None
+            except ValueError:
+                return None
+
+        out["HSE"] = as_int("HSE_VALUE")
+        out["SYSCLK"] = as_int("SYSCLKFreq_VALUE")
+        out["APB1"] = as_int("APB1Freq_Value")
+        out["APB2"] = as_int("APB2Freq_Value")
+        out["PLLCLK"] = as_int("PLLCLKFreq_Value")
+
+        return out
+
+    # ---------------------------------------------------------
+    # USART baud validation (best-effort)
+    # ---------------------------------------------------------
+    def validate_usart_baud(self, usart_block: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """
-        Compute a few key clocks:
-        - HSE
-        - SYSCLK (via PLL)
-        - APB1, APB2 (if prescalers present)
+        Looks for keys like 'USART2.BaudRate' in the raw usart_block
+        and compares against APB bus frequency if available.
+
+        Returns a dict:
+          { "USART2": { "baud": 115200, "bus": "APB1", "bus_freq": 42000000, "status": "ok/warn" }, ... }
         """
-        # HSE value (fallback 8 MHz)
-        hse = self._get_int("HSE_VALUE", 8_000_000)
-        self.clocks["HSE"] = hse
+        results: Dict[str, Dict[str, Any]] = {}
+        clocks = self.compute()
 
-        pll_m = self._get_int("PLL_M")
-        pll_n = self._get_int("PLL_N")
-        pll_p = self._get_int("PLL_P")
+        for name, cfg in usart_block.items():
+            # name is like "USART2"
+            # cfg contains keys like "USART2.IPParameters", "USART2.VirtualMode", maybe "USART2.BaudRate"
+            baud_key = f"{name}.BaudRate"
+            if baud_key not in cfg:
+                continue
 
-        sysclk = None
-        if pll_m and pll_n and pll_p:
-            sysclk = (hse / pll_m) * pll_n / pll_p
+            try:
+                baud = int(cfg[baud_key])
+            except ValueError:
+                continue
 
-        self.clocks["SYSCLK"] = sysclk
+            # Heuristic: F4 family -> USART1/6 on APB2, others on APB1
+            if name in ("USART1", "USART6"):
+                bus = "APB2"
+            else:
+                bus = "APB1"
 
-        # Optional: APB1/APB2 prescalers if present
-        apb1_presc = self._get_int("APB1_PRESCALER", 4)
-        apb2_presc = self._get_int("APB2_PRESCALER", 2)
+            bus_freq = clocks.get(bus)
+            status = "unknown"
+            if bus_freq:
+                # Very rough check: baud must be much smaller than bus clock
+                if baud >= bus_freq // 8:
+                    status = "suspicious"
+                else:
+                    status = "ok"
 
-        if sysclk:
-            self.clocks["APB1"] = sysclk / apb1_presc
-            self.clocks["APB2"] = sysclk / apb2_presc
-        else:
-            self.clocks["APB1"] = None
-            self.clocks["APB2"] = None
+            results[name] = {
+                "baud": baud,
+                "bus": bus,
+                "bus_freq": bus_freq,
+                "status": status,
+            }
 
-        return self.clocks
+        return results
+
+    # ---------------------------------------------------------
+    # Pretty print summary
+    # ---------------------------------------------------------
+    def print_summary(self, usart_block: Dict[str, Dict[str, Any]] | None = None):
+        clocks = self.compute()
+        print("\n=== Clock Tree Summary ===")
+        for name, val in clocks.items():
+            if val is None:
+                print(f"  {name}: unknown")
+            else:
+                print(f"  {name}: {val/1_000_000:.2f} MHz")
+
+        if usart_block:
+            print("\n=== USART Baud Validation ===")
+            results = self.validate_usart_baud(usart_block)
+            if not results:
+                print("  No baud rate info found in .ioc")
+                return
+            for usart, info in results.items():
+                bf = info["bus_freq"]
+                bf_str = f"{bf/1_000_000:.2f} MHz" if bf else "unknown"
+                print(f"  {usart}: baud={info['baud']} on {info['bus']} ({bf_str}) -> {info['status']}")
